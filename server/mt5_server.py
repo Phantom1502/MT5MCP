@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import sys
 import urllib.request
@@ -77,6 +78,9 @@ TIMEFRAME_MAP = {
     "MN1": mt5.TIMEFRAME_MN1,
 }
 DEFAULT_NEWS_RSS_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+EXTERNAL_SYMBOL_MAP = {
+    "DXY": "DX-Y.NYB",
+}
 
 
 def ensure_mt5_connected() -> None:
@@ -172,6 +176,48 @@ def get_market_news(
 
     logger.info("get_market_news completed: count=%s source=%s", len(events), rss_url)
     return events
+
+
+@mcp.tool()
+@report_tool_errors
+def get_external_price(symbol: str = "DXY") -> dict[str, Any]:
+    """Get an external market snapshot for instruments unavailable in the broker terminal."""
+    normalized_symbol = symbol.upper()
+    yahoo_symbol = EXTERNAL_SYMBOL_MAP.get(normalized_symbol, symbol)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.request.quote(yahoo_symbol)}?range=1d&interval=1m"
+    logger.info("get_external_price called: symbol=%s yahoo_symbol=%s", normalized_symbol, yahoo_symbol)
+    request = urllib.request.Request(url, headers={"User-Agent": "MT5MCP/0.1 external-price-reader"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read(2_000_000))
+    except Exception as error:
+        raise RuntimeError(f"Failed to fetch external price for {normalized_symbol}: {error}") from error
+
+    result = payload.get("chart", {}).get("result")
+    if not result:
+        detail = payload.get("chart", {}).get("error")
+        raise RuntimeError(f"External source returned no data for {normalized_symbol}: {detail}")
+
+    metadata = result[0].get("meta", {})
+    price = metadata.get("regularMarketPrice")
+    previous_close = metadata.get("previousClose") or metadata.get("chartPreviousClose")
+    if price is None:
+        raise RuntimeError(f"External source returned no current price for {normalized_symbol}")
+
+    change = float(price) - float(previous_close) if previous_close is not None else None
+    change_percent = (change / float(previous_close) * 100.0) if change is not None and previous_close else None
+    return {
+        "symbol": normalized_symbol,
+        "source_symbol": yahoo_symbol,
+        "price": float(price),
+        "previous_close": float(previous_close) if previous_close is not None else None,
+        "change": change,
+        "change_percent": change_percent,
+        "currency": metadata.get("currency"),
+        "exchange": metadata.get("exchangeName"),
+        "timestamp": int(metadata["regularMarketTime"]) if metadata.get("regularMarketTime") else None,
+        "source": "Yahoo Finance Chart API",
+    }
 
 
 @mcp.tool()

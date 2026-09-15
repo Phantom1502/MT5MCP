@@ -48,6 +48,10 @@ Read-only market-data tools:
 	from the Forex Factory economic-calendar RSS feed, including country, impact, date,
 	forecast, previous, and source link. The RSS URL can be overridden with
 	`MT5_NEWS_RSS_URL`.
+- `get_external_price(symbol="DXY")` returns an external snapshot for instruments not
+	offered by the broker. `DXY` is mapped to Yahoo Finance symbol `DX-Y.NYB` and includes
+	price, previous close, change, currency, exchange, and timestamp. This tool is
+	read-only and must not be used as the execution price for MT5 orders.
 
 For a morning analysis, call `get_market_news` first, then query symbol info, candles,
 and price. News is informational only; trade execution remains restricted to the two

@@ -1,0 +1,766 @@
+/**
+ * dsh-api — DeepSeek Harness HTTP control-plane plugin.
+ *
+ * Exposes dsh's own internal capabilities as HTTP routes on the dsh
+ * webServer (default prefix: `/dsh-api`). Any process on the same machine
+ * — a browser extension, a CLI, a desktop wrapper, an editor integration —
+ * can drive dsh through this single entry point instead of reaching into
+ * its in-process services directly.
+ *
+ * ── Capability layers ────────────────────────────────────────────────────
+ *
+ *   1. dsh-native (always available once the plugin is loaded):
+ *        GET  /dsh-api/health              liveness probe
+ *        GET  /dsh-api/language            read locale.preference
+ *        POST /dsh-api/language            write locale.preference
+ *        GET  /dsh-api/workspace/list      list workspace registry
+ *        GET  /dsh-api/workspace/current   cwd + optional companion state
+ *        POST /dsh-api/workspace/create    create a workspace registry entry
+ *        GET  /dsh-api/events              Server-Sent Events stream:
+ *                                          agent-idle (running → idle),
+ *                                          approval-needed (read-only bypass
+ *                                          of the approval/request waterfall),
+ *                                          heartbeat every 25s.
+ *
+ *   2. companion-bridged (needs a same-machine "companion" process to be
+ *      registered — see the companion protocol below):
+ *        GET  /dsh-api/companion/state     companion state snapshot
+ *        POST /dsh-api/workspace/open      open workspace (dsh restart)
+ *        POST /dsh-api/input/paste         inject text into the dsh UI
+ *        POST /dsh-api/window/show|reload  host window control
+ *        POST /dsh-api/app/quit            quit the host app
+ *
+ *   A companion registers itself by writing `$DSH_HOME/dsh-api-companion.json`
+ *   ({ port, token, pid, ...state }). If the file is missing or its port is
+ *   unreachable, companion-only routes return 503; native routes keep working.
+ *
+ * ── Security ─────────────────────────────────────────────────────────────
+ *
+ *   - dsh binds 127.0.0.1 only; this plugin reuses that socket.
+ *   - Mutating requests (`POST`) validate `Origin`: no Origin (curl/CLI) or
+ *     loopback origins are allowed; any other origin is 403. This prevents
+ *     drive-by browser calls from unrelated sites.
+ *   - Companion proxying carries the discovery-file token as
+ *     `x-dsh-api-companion-token`; the companion is expected to reject
+ *     mismatches.
+ *
+ * ── Install ──────────────────────────────────────────────────────────────
+ *
+ *   1) Copy this file into a dsh profile, e.g.
+ *        $DSH_HOME/profiles/web/dsh-api/index.mjs
+ *   2) Write a patch layer (`--patch`) that inserts the plugin:
+ *        - insert:
+ *            - id: dsh-api
+ *              name: ./dsh-api/index.mjs
+ *   3) Start dsh with the patch:
+ *        dsh web --patch <patch.yml> --port 3080
+ *
+ *   Optional plugin config (via the patch entry's `config: { ... }`):
+ *     basePath      — HTTP route prefix (default: /dsh-api)
+ *     companionFile — companion discovery file
+ *                     (default: $DSH_HOME/dsh-api-companion.json)
+ *
+ * @packageDocumentation
+ */
+
+import { readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import http from 'node:http';
+
+const DEFAULT_BASE_PATH = '/dsh-api';
+const DEFAULT_COMPANION_FILE_NAME = 'dsh-api-companion.json';
+const SUPPORTED_LANGS = ['zh', 'en'];
+const MAX_BODY_BYTES = 1 << 20; // 1 MiB
+const COMPANION_TIMEOUT_MS = 8000;
+const SSE_HEARTBEAT_MS = 25000;
+const APPROVAL_SUMMARY_MAX = 160;
+const ANALYSIS_STATE_FILE_NAME = 'dsh-api-analysis-state.json';
+
+/** `$DSH_HOME` (env override, default `~/.dsh`). */
+function dshHome() {
+  return process.env.DSH_HOME || join(homedir(), '.dsh');
+}
+
+/** Read the companion discovery file; returns null on missing / bad shape. */
+function readCompanionInfo(file) {
+  try {
+    if (!existsSync(file)) return null;
+    const info = JSON.parse(readFileSync(file, 'utf8'));
+    if (!info || typeof info.port !== 'number' || info.port <= 0) return null;
+    return info;
+  } catch {
+    return null;
+  }
+}
+
+function analysisStateFile() {
+  return join(dshHome(), ANALYSIS_STATE_FILE_NAME);
+}
+
+function readCompletedMorningJobs() {
+  try {
+    const value = JSON.parse(readFileSync(analysisStateFile(), 'utf8'));
+    return new Set(Array.isArray(value?.completedMorning) ? value.completedMorning : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function persistCompletedMorningJobs(completedMorning) {
+  try {
+    writeFileSync(
+      analysisStateFile(),
+      JSON.stringify({ completedMorning: [...completedMorning].slice(-500) }, null, 2),
+      'utf8',
+    );
+  } catch {
+    // Analysis completion remains valid even if local state cannot persist.
+  }
+}
+
+function morningJobKey(sessionId, symbol, date = new Date()) {
+  return `${sessionId}|${symbol}|${date.toISOString().slice(0, 10)}`;
+}
+
+/** Read a request body with a hard cap; destroys the socket on overflow. */
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        req.destroy(new Error('request body too large'));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+/** Parse a JSON body (returns {} on empty / invalid). */
+async function readJsonBody(req) {
+  const raw = await readBody(req);
+  try { return raw ? JSON.parse(raw) : {}; }
+  catch { return {}; }
+}
+
+/** Origin check for mutating requests. Missing Origin (CLI) is allowed. */
+function originAllowed(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const host = new URL(origin).hostname;
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Proxy an HTTP call to the companion. Returns `{ status, body }`; transport
+ * errors surface as status 502 / 504 with a null body so the caller can
+ * uniformly translate them to a client-facing 502.
+ */
+function proxyToCompanion(companion, method, path, body) {
+  return new Promise((resolve) => {
+    const payload = body === undefined ? null : JSON.stringify(body);
+    const req = http.request({
+      host: '127.0.0.1',
+      port: companion.port,
+      path,
+      method,
+      headers: {
+        'x-dsh-api-companion-token': companion.token || '',
+        ...(payload !== null
+          ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) }
+          : {}),
+      },
+      timeout: COMPANION_TIMEOUT_MS,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        let parsed = null;
+        try { parsed = JSON.parse(raw); } catch { /* non-JSON body */ }
+        resolve({ status: res.statusCode || 500, body: parsed });
+      });
+    });
+    req.on('timeout', () => { req.destroy(); resolve({ status: 504, body: null }); });
+    req.on('error', () => resolve({ status: 502, body: null }));
+    if (payload !== null) req.write(payload);
+    req.end();
+  });
+}
+
+// ── Response helpers ─────────────────────────────────────────────────────────
+
+function sendJson(res, status, data) {
+  const body = JSON.stringify(data);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    'cache-control': 'no-store',
+  });
+  res.end(body);
+}
+function sendError(res, status, message) { sendJson(res, status, { ok: false, error: message }); }
+
+/**
+ * A "handler" is `(ctxLite, req, res) => Promise<void>` where ctxLite exposes
+ * only what handlers legitimately need. Keeping this contract narrow lets
+ * the dispatch table stay short and testable.
+ */
+function buildRoutes({ getCompanion, sseHub, completedMorning }) {
+  return {
+    // ── dsh-native GETs ──────────────────────────────────────────────────
+    'GET health':            handleHealth(getCompanion),
+    'GET ':                  handleHealth(getCompanion), // '/dsh-api' with no trailing sub
+    'GET language':          handleLanguageGet,
+    'GET workspace/list':    handleWorkspaceList,
+    'GET workspace/current': handleWorkspaceCurrent(getCompanion),
+    'GET session/list':      handleSessionList,
+    'GET events':            handleEventStream(sseHub),
+
+    'POST session/analyze':  handleSessionAnalyze(sseHub, completedMorning),
+
+    // ── companion state (needs companion) ────────────────────────────────
+    'GET companion/state':   handleCompanionState(getCompanion),
+
+    // ── mutating routes (Origin-checked before dispatch) ─────────────────
+    'POST language':         handleLanguagePost,
+    'POST workspace/create': handleWorkspaceCreate,
+    'POST workspace/open':   handleWorkspaceOpen(getCompanion),
+    'POST input/paste':      handleInputPaste(getCompanion),
+    'POST window/show':      handleCompanionBridge(getCompanion, 'POST', '/companion/window/show'),
+    'POST window/reload':    handleCompanionBridge(getCompanion, 'POST', '/companion/window/reload'),
+    'POST app/quit':         handleCompanionBridge(getCompanion, 'POST', '/companion/app/quit'),
+  };
+}
+
+// ── Handler implementations ──────────────────────────────────────────────────
+
+const handleHealth = (getCompanion) => async ({ dshPort }, _req, res) => {
+  const companion = getCompanion();
+  sendJson(res, 200, {
+    ok: true,
+    service: 'dsh-api',
+    dshPort,
+    cwd: process.cwd(),
+    companion: companion ? { port: companion.port, pid: companion.pid || null } : null,
+  });
+};
+
+const handleLanguageGet = async ({ settings }, _req, res) => {
+  let language = null;
+  try {
+    const locale = settings?.get('locale');
+    if (locale && typeof locale === 'object') language = locale.preference || null;
+  } catch { /* namespace not registered yet */ }
+  sendJson(res, 200, { ok: true, language, supported: SUPPORTED_LANGS });
+};
+
+const handleWorkspaceList = async ({ workspaceRegistry }, _req, res) => {
+  if (workspaceRegistry === undefined) {
+    // No registry ⇒ empty list, not an error: the plugin can still be useful
+    // (e.g. language) in profiles that don't include the workspace service.
+    return sendJson(res, 200, { ok: true, workspaces: [] });
+  }
+  const workspaces = workspaceRegistry.list().map((w) => ({
+    id: w.id,
+    path: w.path,
+    title: w.title,
+    createdAt: w.createdAt,
+    sessionCount: (w.sessionIds || []).length,
+  }));
+  sendJson(res, 200, { ok: true, workspaces });
+};
+
+const handleSessionList = async ({ agents }, _req, res) => {
+  if (agents === undefined) return sendError(res, 503, 'agents service unavailable');
+  const sessions = agents.list().map(agent => ({
+    sessionId: agent.id,
+    status: agent.status,
+    title: agent.session?.title || agent.session?.header?.title || '',
+    cwd: agent.session?.header?.cwd || null,
+  }));
+  sendJson(res, 200, { ok: true, sessions });
+};
+
+const handleWorkspaceCurrent = (getCompanion) => async ({ dshPort }, _req, res) => {
+  const companion = getCompanion();
+  let companionState = null;
+  if (companion) {
+    const r = await proxyToCompanion(companion, 'GET', '/companion/state');
+    if (r.body && r.body.ok) companionState = r.body.state || null;
+  }
+  sendJson(res, 200, { ok: true, cwd: process.cwd(), dshPort, companion: companionState });
+};
+
+const handleCompanionState = (getCompanion) => async (_ctx, _req, res) => {
+  const companion = getCompanion();
+  if (!companion) return sendError(res, 503, 'companion not available');
+  const r = await proxyToCompanion(companion, 'GET', '/companion/state');
+  if (!r.body || !r.body.ok) return sendError(res, 502, 'companion unreachable');
+  sendJson(res, 200, { ok: true, ...r.body.state });
+};
+
+const handleLanguagePost = async ({ settings }, req, res) => {
+  if (settings === undefined) return sendError(res, 503, 'settings service unavailable');
+  const body = await readJsonBody(req);
+  const language = typeof body.language === 'string' ? body.language : null;
+  if (!language || !SUPPORTED_LANGS.includes(language)) {
+    return sendError(res, 400, `language must be one of: ${SUPPORTED_LANGS.join(', ')}`);
+  }
+  await settings.update('locale', { preference: language });
+  sendJson(res, 200, { ok: true, language });
+};
+
+const handleWorkspaceOpen = (getCompanion) => async (_ctx, req, res) => {
+  const companion = getCompanion();
+  if (!companion) return sendError(res, 503, 'companion not available');
+  const body = await readJsonBody(req);
+  const pathValue = typeof body.path === 'string' && body.path.length > 0 ? body.path : null;
+  const r = await proxyToCompanion(companion, 'POST', '/companion/workspace/open', { path: pathValue });
+  if (!r.body || !r.body.ok) {
+    const msg = (r.body && r.body.error) || 'workspace switch failed';
+    return sendError(res, (r.body && r.body.error) ? 400 : 502, msg);
+  }
+  sendJson(res, 200, { ok: true, ...r.body.result });
+};
+
+const handleInputPaste = (getCompanion) => async (_ctx, req, res) => {
+  const companion = getCompanion();
+  if (!companion) return sendError(res, 503, 'companion not available');
+  const body = await readJsonBody(req);
+  if (typeof body.text !== 'string') return sendError(res, 400, 'text (string) is required');
+  const r = await proxyToCompanion(companion, 'POST', '/companion/input/paste', { text: body.text });
+  if (!r.body || !r.body.ok) return sendError(res, 502, (r.body && r.body.error) || 'paste failed');
+  sendJson(res, 200, { ok: true });
+};
+
+const pendingAnalysis = new Map();
+
+const handleSessionAnalyze = (sseHub, completedMorning) => async ({ sessionController }, req, res) => {
+  if (sessionController === undefined) return sendError(res, 503, 'sessionController unavailable');
+  const body = await readJsonBody(req);
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+  const jobType = typeof body.jobType === 'string' ? body.jobType : '';
+  const intent = typeof body.intent === 'string' ? body.intent : '';
+  const symbol = typeof body.symbol === 'string' ? body.symbol.trim() : '';
+  const requestId = typeof body.requestId === 'string' && body.requestId.trim()
+    ? body.requestId.trim()
+    : randomUUID();
+
+  if (!sessionId) return sendError(res, 400, 'sessionId (string) is required');
+  if (!['morning_context', 'ltf_trigger'].includes(jobType)) {
+    return sendError(res, 400, 'jobType must be morning_context or ltf_trigger');
+  }
+  if (jobType === 'ltf_trigger' && !['open', 'tp'].includes(intent)) {
+    return sendError(res, 400, 'intent must be open or tp for ltf_trigger');
+  }
+  if (!symbol) return sendError(res, 400, 'symbol (string) is required');
+  const morningKey = jobType === 'morning_context' ? morningJobKey(sessionId, symbol) : null;
+  if (morningKey && completedMorning.has(morningKey)) {
+    return sendJson(res, 200, {
+      ok: true,
+      requestId,
+      sessionId,
+      jobType,
+      status: 'already_completed',
+      date: morningKey.slice(-10),
+    });
+  }
+  if (pendingAnalysis.has(requestId)) {
+    return sendJson(res, 202, { ok: true, requestId, status: 'duplicate' });
+  }
+  if (pendingAnalysis.has(sessionId)) {
+    return sendError(res, 409, `session ${sessionId} already has an analysis job`);
+  }
+
+  const side = typeof body.side === 'string' ? body.side.toLowerCase() : null;
+  const timeframes = Array.isArray(body.timeframes)
+    ? body.timeframes.filter(value => typeof value === 'string').slice(0, 8)
+    : [];
+  const contextRef = typeof body.contextRef === 'string' ? body.contextRef : null;
+  const prompt = [
+    'MT5 scheduler trigger. Perform the requested analysis using the available MT5 MCP tools.',
+    `Job type: ${jobType}`,
+    `Symbol: ${symbol}`,
+    side ? `Side: ${side}` : null,
+    timeframes.length > 0 ? `Timeframes: ${timeframes.join(', ')}` : null,
+    contextRef ? `Morning context reference: ${contextRef}` : null,
+    '',
+    jobType === 'morning_context'
+      ? 'Build and retain the morning market context. Do not open or close trades.'
+      : `Analyze the LTF trigger against the current context for intent "${intent}". ${intent === 'open' ? 'Only call ask_for_open if the server-side conditions are satisfied.' : 'Only call ask_for_tp if the server-side TP conditions are satisfied.'} Do not ask for confirmation.`,
+  ].filter(Boolean).join('\n');
+
+  pendingAnalysis.set(requestId, { requestId, sessionId, jobType, intent: intent || null, symbol, createdAt: Date.now() });
+  pendingAnalysis.set(sessionId, requestId);
+  try {
+    const controller = new AbortController();
+    await sessionController.prompt({
+      sessionId,
+      mode: 'queue',
+      content: [{ type: 'text', text: prompt }],
+      requestId,
+    }, controller.signal);
+  } catch (error) {
+    pendingAnalysis.delete(requestId);
+    pendingAnalysis.delete(sessionId);
+    return sendError(res, 409, error instanceof Error ? error.message : String(error));
+  }
+
+  sendJson(res, 202, { ok: true, requestId, sessionId, jobType, intent: intent || null, status: 'accepted' });
+};
+
+/**
+ * Create a workspace-registry entry. Body: `{ path: string, title?: string }`.
+ *
+ * We only register the workspace here; switching dsh's cwd to it still goes
+ * through `POST /workspace/open` (which is companion-bridged, since only the
+ * desktop wrapper can restart dsh). Callers that want the full "new-and-open"
+ * flow do two calls in sequence.
+ */
+const handleWorkspaceCreate = async ({ workspaceRegistry }, req, res) => {
+  if (workspaceRegistry === undefined) return sendError(res, 503, 'workspaceRegistry unavailable');
+  const body = await readJsonBody(req);
+
+  // path — must be a non-empty absolute string. workspaceRegistry does its
+  // own normalisation (symlink resolution, trailing-slash strip), but a
+  // relative or empty path is a client bug we can reject up front with a
+  // useful message rather than shipping to the registry only to bounce back
+  // with a less specific error.
+  const rawPath = body?.path;
+  if (typeof rawPath !== 'string' || rawPath.length === 0) {
+    return sendError(res, 400, 'path (non-empty string) is required');
+  }
+  if (!rawPath.startsWith('/') && !/^[a-zA-Z]:[\\/]/.test(rawPath)) {
+    return sendError(res, 400, 'path must be absolute (got ' + JSON.stringify(rawPath) + ')');
+  }
+
+  // title — optional, string, capped at 200 chars so we don't accept an
+  // essay by accident (registry stores it, UIs render it).
+  let title;
+  if (body?.title !== undefined && body.title !== null) {
+    if (typeof body.title !== 'string') return sendError(res, 400, 'title must be a string');
+    if (body.title.length > 200) return sendError(res, 400, 'title must be <= 200 characters');
+    if (body.title.length > 0) title = body.title;
+  }
+
+  try {
+    const w = await workspaceRegistry.create(rawPath, title);
+    sendJson(res, 200, {
+      ok: true,
+      workspace: {
+        id: w.id, path: w.path, title: w.title, createdAt: w.createdAt,
+      },
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // workspaceRegistry throws with recognisable substrings for the two
+    // conditions clients most often want to disambiguate. Anything else
+    // stays a generic 400 rather than being classified incorrectly.
+    const status =
+      /already exists|duplicate/i.test(msg) ? 409 :
+      /not found|ENOENT/i.test(msg) ? 404 :
+      400;
+    sendError(res, status, msg);
+  }
+};
+
+/**
+ * SSE (Server-Sent Events) fan-out endpoint. One HTTP GET per subscriber; the
+ * subscriber keeps the socket open. We emit `agent-idle` / `approval-needed`
+ * events pushed by the subscription installed in `apply()`, and a `heartbeat`
+ * every 25s so proxies / load balancers don't idle-kill the stream.
+ *
+ * The subscriber's lifecycle:
+ *   - registers itself into `sseHub.subscribers` on connect
+ *   - closes its own timer + unregisters on `req.close` / `req.error`
+ *
+ * The subscriber list is process-scoped; when dsh shuts down, sockets close
+ * naturally and the hub's `.close()` (called by the `ctx.effect` disposer)
+ * writes a farewell `server-stopping` event first.
+ */
+const handleEventStream = (sseHub) => async (_ctx, req, res) => {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-store',
+    'connection': 'keep-alive',
+    // Encourage CDNs / proxies not to buffer.
+    'x-accel-buffering': 'no',
+  });
+  // Advise clients to retry every 3s if the connection drops without warning.
+  res.write('retry: 3000\n\n');
+  // A `ready` frame so the client can log a successful connect immediately.
+  // Echo Last-Event-ID (if the client sent one) so a caller can tell whether
+  // the server saw its resume hint. This stream is ephemeral — we don't
+  // replay past events — but reporting the number back is cheap and makes
+  // the reconnect handshake observable.
+  const lastEventId = typeof req.headers['last-event-id'] === 'string'
+    ? req.headers['last-event-id']
+    : null;
+  res.write(`event: ready\ndata: ${JSON.stringify({
+    timestamp: Date.now(),
+    nextEventId: sseHub.nextEventId,
+    resumedFrom: lastEventId,
+  })}\n\n`);
+
+  const client = { res, hb: null };
+  client.hb = setInterval(() => {
+    try { res.write(`event: heartbeat\ndata: {"timestamp":${Date.now()}}\n\n`); }
+    catch { /* torn */ }
+  }, SSE_HEARTBEAT_MS);
+  // Node timers block process exit by default; SSE keep-alives shouldn't.
+  if (typeof client.hb.unref === 'function') client.hb.unref();
+
+  sseHub.subscribers.add(client);
+
+  const cleanup = () => {
+    if (!sseHub.subscribers.has(client)) return;
+    sseHub.subscribers.delete(client);
+    try { clearInterval(client.hb); } catch { /* ignore */ }
+    try { res.end(); } catch { /* already closed */ }
+  };
+  req.on('close', cleanup);
+  req.on('error', cleanup);
+};
+
+/** Generic pass-through for endpoints whose only job is to forward the call. */
+const handleCompanionBridge = (getCompanion, method, path) => async (_ctx, _req, res) => {
+  const companion = getCompanion();
+  if (!companion) return sendError(res, 503, 'companion not available');
+  const r = await proxyToCompanion(companion, method, path);
+  sendJson(res, r.body && r.body.ok ? 200 : 502, r.body || { ok: false, error: 'companion error' });
+};
+
+// ── Plugin entry point ───────────────────────────────────────────────────────
+
+export default {
+  name: 'dsh-api',
+  // webServer is provided by dsh-host-webserver; hard-inject so Cordis waits
+  // for that service before activating this plugin (loader entries are
+  // applied in parallel, so we can't assume the service is up otherwise).
+  inject: ['webServer'],
+
+  apply(ctx, config) {
+    config = config || {};
+    const basePath = typeof config.basePath === 'string' && config.basePath.startsWith('/')
+      ? config.basePath.replace(/\/+$/, '') || DEFAULT_BASE_PATH
+      : DEFAULT_BASE_PATH;
+    const companionFile = config.companionFile || join(dshHome(), DEFAULT_COMPANION_FILE_NAME);
+    const webServer = ctx.webServer;
+    const getCompanion = () => readCompanionInfo(companionFile);
+
+    // ── SSE broadcast hub ────────────────────────────────────────────────
+    //
+    // Everything that pushes an event through the plugin goes through this
+    // one struct: the HTTP handler adds subscribers, the ctx.on listeners
+    // publish via broadcast(). Keeping the hub inline (instead of a module-
+    // scoped singleton) means a second plugin instance — should there ever
+    // be one — gets its own independent fan-out and doesn't leak listeners
+    // across ctx boundaries.
+    const sseHub = {
+      subscribers: new Set(),
+      // Monotonic id assigned to every fan-out frame. Frames a subscriber
+      // misses because it wasn't connected are gone — this stream is
+      // ephemeral, not a durable log — but the id still lets a client
+      // sanity-check ordering and, on reconnect, notice a gap in its own
+      // received sequence. We echo `Last-Event-ID` in the ready frame so
+      // the client can log the number it left off at.
+      nextEventId: 1,
+      broadcast(eventName, payload) {
+        const id = this.nextEventId++;
+        const line = `id: ${id}\nevent: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`;
+        // Iterate a snapshot: a write may synchronously .end() a torn socket,
+        // and mutating a Set during iteration is a foot-gun.
+        for (const c of Array.from(this.subscribers)) {
+          try { c.res.write(line); }
+          catch {
+            // Drop the failed subscriber; its `req.close` handler will also
+            // run and be a no-op (Set.delete on a missing key is fine).
+            try { clearInterval(c.hb); } catch { /* ignore */ }
+            this.subscribers.delete(c);
+          }
+        }
+      },
+      close() {
+        for (const c of Array.from(this.subscribers)) {
+          try { c.res.write(`event: server-stopping\ndata: {"timestamp":${Date.now()}}\n\n`); }
+          catch { /* ignore */ }
+          try { clearInterval(c.hb); } catch { /* ignore */ }
+          try { c.res.end(); } catch { /* ignore */ }
+        }
+        this.subscribers.clear();
+      },
+    };
+
+    const completedMorning = readCompletedMorningJobs();
+    const routes = buildRoutes({ getCompanion, sseHub, completedMorning });
+
+    // ── Subscribe to internal events and broadcast on the SSE hub ────────
+
+    // 1) agent/status: emit `agent-idle` when an agent finished a turn
+    //    (running → idle). We keep a WeakMap keyed by agent identity so the
+    //    entry gets GC'd alongside the agent — no manual cleanup needed.
+    const lastStatus = new WeakMap();
+    ctx.on('agent/status', ({ agent, status }) => {
+      const prev = lastStatus.get(agent);
+      lastStatus.set(agent, status);
+      if (prev === 'running' && status === 'idle') {
+        const sessionId = extractSessionId(agent);
+        const requestId = sessionId ? pendingAnalysis.get(sessionId) : undefined;
+        const job = typeof requestId === 'string' ? pendingAnalysis.get(requestId) : undefined;
+        if (job) {
+          pendingAnalysis.delete(requestId);
+          pendingAnalysis.delete(sessionId);
+          if (job.jobType === 'morning_context') {
+            completedMorning.add(morningJobKey(job.sessionId, job.symbol));
+            persistCompletedMorningJobs(completedMorning);
+          }
+          sseHub.broadcast('analysis-completed', {
+            requestId: job.requestId,
+            sessionId: job.sessionId,
+            jobType: job.jobType,
+            symbol: job.symbol,
+            timestamp: Date.now(),
+          });
+        }
+        sseHub.broadcast('agent-idle', {
+          sessionId,
+          title: extractSessionTitle(agent),
+          previousStatus: prev,
+          timestamp: Date.now(),
+        });
+      }
+    });
+
+    // 2) approval/request: a WATERFALL, and we participate as a strict
+    //    read-only bypass — never inspect a decision, never alter one, never
+    //    consume the request. `return next()` hands control straight back to
+    //    the real answerer chain, so other listeners on this waterfall see
+    //    exactly what they'd see if we weren't installed.
+    ctx.on('approval/request', (req, next) => {
+      try {
+        sseHub.broadcast('approval-needed', {
+          sessionId: req?.session?.id ?? req?.sessionId ?? null,
+          kind: typeof req?.kind === 'string' ? req.kind : null,
+          summary: summarizeApprovalRequest(req),
+          timestamp: Date.now(),
+        });
+      } catch {
+        // A malformed request must not break the approval chain.
+      }
+      return next();
+    });
+
+    // ── HTTP route registration ──────────────────────────────────────────
+
+    ctx.effect(() => {
+      const unregister = webServer.register({
+        kind: 'prefix',
+        path: basePath,
+        handler: (req, res) => dispatch(ctx, routes, basePath, req, res),
+      });
+      return () => {
+        // Close SSE first so subscribers get the farewell event before the
+        // HTTP route disappears out from under them.
+        sseHub.close();
+        unregister();
+      };
+    });
+  },
+};
+
+/**
+ * Best-effort extraction of a session id from an agent. Reads only the
+ * commonly-published shapes; falls back to `null` so a schema change in dsh
+ * never breaks the notification pipeline.
+ */
+function extractSessionId(agent) {
+  try {
+    return agent?.session?.id ?? agent?.sessionId ?? agent?.id ?? null;
+  } catch { return null; }
+}
+
+function extractSessionTitle(agent) {
+  try {
+    return (
+      agent?.session?.title ??
+      agent?.session?.header?.title ??
+      agent?.title ??
+      ''
+    );
+  } catch { return ''; }
+}
+
+/**
+ * Reduce an ApprovalRequest to a short user-facing string. Dsh's approval
+ * requests are polymorphic (bash command, fs write, generic ask, …), so we
+ * take the first non-empty field we recognise and truncate. Never throws.
+ */
+function summarizeApprovalRequest(req) {
+  if (!req || typeof req !== 'object') return '';
+  const candidates = [
+    req.summary,
+    req.title,
+    req.description,
+    req.command,
+    req.tool,
+    req.toolName,
+    req.message,
+  ];
+  let picked = '';
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.length > 0) { picked = c; break; }
+  }
+  if (!picked && req.detail && typeof req.detail === 'object') {
+    // Some approval kinds nest a `detail` object; use its first string leaf.
+    for (const v of Object.values(req.detail)) {
+      if (typeof v === 'string' && v.length > 0) { picked = v; break; }
+    }
+  }
+  if (picked.length > APPROVAL_SUMMARY_MAX) {
+    picked = picked.slice(0, APPROVAL_SUMMARY_MAX - 1) + '…';
+  }
+  return picked;
+}
+
+async function dispatch(ctx, routes, basePath, req, res) {
+  try {
+    // These services are provided by other loader entries; look them up per
+    // request so a slow-starting service doesn't block plugin activation.
+    const ctxLite = {
+      settings: ctx.get('settings'),
+      workspaceRegistry: ctx.get('workspaceRegistry'),
+      sessionController: ctx.get('sessionController'),
+      agents: ctx.get('agents'),
+      dshPort: req.socket.localPort || null,
+    };
+    const url = new URL(req.url || '/', 'http://localhost');
+    const sub = url.pathname.slice(basePath.length).replace(/^\/+/, '');
+    const method = req.method || 'GET';
+    const key = `${method} ${sub}`;
+
+    // Origin check runs before all mutating handlers. Missing entries fall
+    // through to the 404/405 checks below without touching Origin at all.
+    if (method !== 'GET' && !originAllowed(req)) return sendError(res, 403, 'origin not allowed');
+
+    const handler = routes[key];
+    if (handler) return handler(ctxLite, req, res);
+
+    // Distinguish "unknown path" vs. "known path, wrong method" for better UX.
+    const anyMethodOnPath = Object.keys(routes).some((k) => k.endsWith(` ${sub}`));
+    if (anyMethodOnPath) return sendError(res, 405, 'method not allowed');
+    return sendError(res, 404, `unknown ${basePath} endpoint: /${sub}`);
+  } catch (err) {
+    sendError(res, 500, err instanceof Error ? err.message : String(err));
+  }
+}

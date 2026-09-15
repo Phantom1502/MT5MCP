@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.mjs text
+*.md text
+*.yml text
+*.yaml text
+LICENSE text
