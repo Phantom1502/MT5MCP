@@ -1,0 +1,52 @@
+[project]
+name = "mt5mcp"
+version = "0.1.0"
+description = "MetaTrader 5 MCP server"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=2.0.0",
+    "pydantic>=2.0.0",
+    "MetaTrader5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["server"]
+
+[project.scripts]
+mt5mcp = "server.mt5_server:main"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.8",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["README.md"]
+
+[tool.ruff.lint]
+select = [
+    "C4",   # flake8-comprehensions
+    "C90",  # mccabe
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "PERF", # Perflint
+    "PL",   # Pylint
+    "UP",   # pyupgrade
+]
+ignore = ["PERF203", "PLC0415", "PLR0402"]
+mccabe.max-complexity = 24 # Default is 10
+
+[tool.ruff.lint.pylint]
+allow-magic-value-types = ["bytes", "float", "int", "str"]
+max-args = 23                                              # Default is 5
+max-branches = 23                                          # Default is 12
+max-returns = 13                                           # Default is 6
+max-statements = 102                                       # Default is 50
