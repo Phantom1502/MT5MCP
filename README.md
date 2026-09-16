@@ -29,6 +29,35 @@ $env:MT5_TERMINAL_PATH = "E:\Exness\terminal64.exe"
 
 Start the terminal in portable mode, then log in to the account before starting DSH.
 
+## Per-symbol trading configuration
+
+`ask_for_open` and `ask_for_tp` only accept symbols explicitly configured on the
+server. The client cannot provide or override thresholds, risk, volume, SL, or TP
+settings.
+
+Edit `SYMBOL_TRADE_CONFIG` in `server/config.py`. Each symbol gets its own
+configuration:
+
+```text
+SYMBOL_TRADE_CONFIG = {
+	"XAUUSDc": {
+		"buy_threshold_points": 500.0,
+		"sell_threshold_points": 500.0,
+		"buy_sl_points": 5000.0,
+		"sell_sl_points": 5000.0,
+		"risk_percent": 0.25,
+		"max_volume": 1.0,
+		"tp_multiplier": 2.0,
+		"buy_sl_required": 1.0,
+		"sell_sl_required": 1.0,
+		"tp_profit_rate_percent": 2.0,
+	},
+}
+```
+
+An omitted symbol configuration means trading is disabled for that symbol.
+Market-data tools remain read-only and can still query other symbols.
+
 ## MCP tools
 
 Trading tools:

@@ -15,7 +15,12 @@ from mcp.server import MCPServer
 from pydantic import BaseModel, Field
 
 from server.config import get_trade_config
-from server.trading_logic import _get_position_side, _safe_float, evaluate_open_signal, evaluate_tp_signal
+from server.trading_logic import (
+    _get_position_side, 
+    _safe_float, 
+    evaluate_open_signal, 
+    evaluate_tp_signal
+)
 
 mcp = MCPServer("mt5")
 logging.basicConfig(
@@ -358,6 +363,9 @@ def ask_for_open(
     """Check the open condition and execute the trade when it's allowed by the internal MT5 logic."""
     logger.info("ask_for_open called: symbol=%s side=%s", symbol, side)
     try:
+        config = get_trade_config(symbol)
+        if config is None:
+            raise ValueError(f"Trading is not configured for symbol {symbol}.")
         ensure_mt5_connected()
         ensure_symbol_selected(symbol)
         account = mt5.account_info()
@@ -382,8 +390,13 @@ def ask_for_open(
         logger.error("Symbol is unavailable: symbol=%s mt5_error=%s", symbol, mt5.last_error())
         raise RuntimeError(f"Symbol {symbol} is not available in the MT5 terminal.")
 
-    config = get_trade_config()
     point_size = float(symbol_info.point)
+    tick_value = float(symbol_info.trade_tick_value)
+    tick_size = float(symbol_info.trade_tick_size)
+    lot_step = float(symbol_info.volume_step)
+    min_lot = float(symbol_info.volume_min)
+    max_lot = float(symbol_info.volume_max)
+
     threshold_points = config["buy_threshold_points"] if side == "buy" else config["sell_threshold_points"]
     threshold_price = threshold_points * point_size
 
@@ -394,6 +407,12 @@ def ask_for_open(
         current_price=current_price,
         positions=positions,
         side=side,
+        point=point_size,
+        tick_value=tick_value,
+        tick_size=tick_size,
+        lot_step=lot_step,
+        min_lot=min_lot,
+        max_lot=max_lot,
         threshold=threshold_price,
         account_balance=account_balance,
     )
@@ -402,20 +421,40 @@ def ask_for_open(
     if not decision["allowed"]:
         return decision
 
-    sl_points = config["buy_sl_points"] if side == "buy" else config["sell_sl_points"]
-    sl_distance = sl_points * point_size
-    sl = current_price - sl_distance if side == "buy" else current_price + sl_distance
-    tp_distance = max((current_price - sl) * config["tp_multiplier"], 0.0) if side == "buy" else max((sl - current_price) * config["tp_multiplier"], 0.0)
-    tp = current_price + tp_distance if side == "buy" else current_price - tp_distance
+    volume = float(decision["volume"])
+    sl = float(decision["stop_loss"])
+
+    # Port of the margin-cap step in CalculateLotSize: if the projected margin would eat
+    # more than 90% of free margin, shrink volume down to fit, floored to a lot_step multiple.
+    order_type = mt5.ORDER_TYPE_BUY if side == "buy" else mt5.ORDER_TYPE_SELL
+    free_margin = float(account.margin_free) if hasattr(account, "margin_free") else float(mt5.account_info().margin_free)
+    required_margin = mt5.order_calc_margin(order_type, symbol, volume, current_price)
+    if required_margin is not None and required_margin > free_margin * 0.9:
+        margin_per_lot = required_margin / volume if volume > 0 else 0.0
+        if margin_per_lot > 0:
+            capped_volume = ((free_margin * 0.9 / margin_per_lot) // lot_step) * lot_step
+            logger.info(
+                "ask_for_open margin cap applied: symbol=%s side=%s original_volume=%s capped_volume=%s required_margin=%s free_margin=%s",
+                symbol, side, volume, capped_volume, required_margin, free_margin,
+            )
+            volume = capped_volume
+
+    if volume < min_lot:
+        decision["allowed"] = False
+        decision["reason"] = f"Volume {volume} below min lot {min_lot} after margin cap."
+        decision["volume"] = 0.0
+        return decision
+
+    decision["volume"] = volume
 
     request = {
-        "action": mt5.ORDER_TYPE_BUY if side == "buy" else mt5.ORDER_TYPE_SELL,
+        "action": order_type,
         "symbol": symbol,
-        "volume": float(decision["volume"]),
-        "type": mt5.ORDER_TYPE_BUY if side == "buy" else mt5.ORDER_TYPE_SELL,
+        "volume": volume,
+        "type": order_type,
         "price": current_price,
-        "sl": float(sl),
-        "tp": float(tp),
+        "sl": sl,
+        "tp": 0.0,
         "comment": "ask_for_open",
         "type_filling": mt5.ORDER_FILLING_FOK,
     }
@@ -438,7 +477,7 @@ def ask_for_open(
     decision["order_result"] = str(order_result.comment)
     decision["entry_price"] = float(order_result.price)
     decision["stop_loss"] = float(order_result.sl if order_result.sl else sl)
-    decision["take_profit"] = float(order_result.tp if order_result.tp else tp)
+    decision["take_profit"] = float(order_result.tp) if order_result.tp else 0.0
     decision["reason"] = "Order executed successfully by MT5."
     logger.info("ask_for_open completed: symbol=%s side=%s ticket=%s", symbol, side, order_result.order)
     return decision
@@ -446,8 +485,8 @@ def ask_for_open(
 
 @mcp.tool()
 @report_tool_errors
-def ask_for_tp(symbol: str) -> dict[str, Any]:
-    """Check whether the current position group for a symbol should be closed.
+def ask_for_tp(symbol: str, side: str) -> dict[str, Any]:
+    """Check whether the current position group (one side only) for a symbol should be closed.
 
     Close is allowed only if the realized profit exceeds the configured rate versus balance.
     """
@@ -477,7 +516,20 @@ def ask_for_tp(symbol: str) -> dict[str, Any]:
             "reason": "Positions closed successfully." if closed else "No positions matched the requested side.",
         }
 
-    logger.info("ask_for_tp called: symbol=%s", symbol)
+    logger.info("ask_for_tp called: symbol=%s side=%s", symbol, side)
+    side = side.lower()
+    if side not in {"buy", "sell"}:
+        raise ValueError("side must be 'buy' or 'sell'")
+
+    config = get_trade_config(symbol)
+    if config is None:
+        return {
+            "ok": False,
+            "symbol": symbol,
+            "side": side,
+            "allowed": False,
+            "reason": f"Trading is not configured for symbol {symbol}.",
+        }
     ensure_mt5_connected()
     ensure_symbol_selected(symbol)
     account = mt5.account_info()
@@ -491,55 +543,50 @@ def ask_for_tp(symbol: str) -> dict[str, Any]:
         raise RuntimeError(f"Failed to get tick for {symbol}: {mt5.last_error()}")
 
     positions = mt5.positions_get(symbol=symbol) or []
-    logger.info("ask_for_tp positions: symbol=%s count=%d", symbol, len(positions))
-    if not positions:
-        return {"symbol": symbol, "allowed": False, "reason": "No position found for symbol."}
+    group_positions = [pos for pos in positions if _get_position_side(pos) == side]
+    logger.info("ask_for_tp positions: symbol=%s side=%s count=%d", symbol, side, len(group_positions))
+    if not group_positions:
+        return {"symbol": symbol, "side": side, "allowed": False, "reason": "No position found for this side."}
 
-    side_positions = positions
-    current_price = float(current.bid if getattr(side_positions[0], "type", 0) == 0 else current.ask)
-    result = {
+    current_price = float(current.bid if side == "buy" else current.ask)
+    threshold = config["tp_profit_rate_percent"]
+    result: dict[str, Any] = {
         "symbol": symbol,
+        "side": side,
         "allowed": False,
         "profit": 0.0,
         "profit_rate_percent": 0.0,
-        "threshold_rate_percent": get_trade_config()["tp_profit_rate_percent"],
+        "threshold_rate_percent": threshold,
         "reason": "",
     }
 
     group_profit = 0.0
-    for pos in side_positions:
+    for pos in group_positions:
         entry = _safe_float(getattr(pos, "price_open", current_price), current_price)
         volume = _safe_float(getattr(pos, "volume", 0.0), 0.0)
-        pos_type = _get_position_side(pos)
-        if pos_type == "buy":
+        if side == "buy":
             group_profit += (current_price - entry) * volume
         else:
             group_profit += (entry - current_price) * volume
 
     balance = max(account_balance, 1.0)
     profit_rate = (group_profit / balance) * 100.0
-    threshold = get_trade_config()["tp_profit_rate_percent"]
     result["profit"] = group_profit
     result["profit_rate_percent"] = profit_rate
-    result["threshold_rate_percent"] = threshold
     logger.info(
-        "ask_for_tp decision: symbol=%s profit=%s profit_rate=%s threshold=%s",
-        symbol,
-        group_profit,
-        profit_rate,
-        threshold,
+        "ask_for_tp decision: symbol=%s side=%s profit=%s profit_rate=%s threshold=%s",
+        symbol, side, group_profit, profit_rate, threshold,
     )
 
     if group_profit <= 0:
         result["reason"] = "Group has not made profit yet."
         return result
     if profit_rate >= threshold:
-        close_side = _get_position_side(side_positions[0])
-        close_result = close_all_positions_by_type(symbol, close_side)
+        close_result = close_all_positions_by_type(symbol, side)
         result["allowed"] = True
         result["reason"] = f"Group profit rate {profit_rate:.2f}% is above threshold {threshold:.2f}%."
         result["close_result"] = close_result
-        logger.info("ask_for_tp close result: symbol=%s side=%s result=%s", symbol, close_side, close_result)
+        logger.info("ask_for_tp close result: symbol=%s side=%s result=%s", symbol, side, close_result)
         return result
 
     result["reason"] = f"Group profit rate {profit_rate:.2f}% is below threshold {threshold:.2f}%."

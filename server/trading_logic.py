@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from server.config import get_trade_config
+from server.config import DEFAULT_TRADE_CONFIG, get_trade_config
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -18,61 +18,80 @@ def _get_position_side(position: Any) -> str:
     return "buy" if str(getattr(position, "type", "")).lower() in {"buy", "0"} else "sell"
 
 
-def compute_equilibrium_price(current_price: float, positions: list[Any], side: Literal["buy", "sell"]) -> float:
-    """Compute equilibrium using only the same-side group: buy positions for buy logic, sell positions for sell logic."""
-    filtered = [pos for pos in positions if _get_position_side(pos) == side]
-    if not filtered:
-        return current_price
-
-    total_price = 0.0
-    total_volume = 0.0
-    for pos in filtered:
-        volume = _safe_float(getattr(pos, "volume", 0.0), 0.0)
-        if volume <= 0:
-            continue
-        entry = _safe_float(getattr(pos, "price_open", current_price), current_price)
-        total_price += entry * volume
-        total_volume += volume
-
-    if total_volume <= 0:
-        return current_price
-
-    return total_price / total_volume
+def _filter_same_side(positions: list[Any], side: Literal["buy", "sell"]) -> list[Any]:
+    return [pos for pos in positions if _get_position_side(pos) == side]
 
 
-def check_buy_stoploss_moved(positions: list[Any]) -> bool:
-    """Return True when existing buy positions already have stop-loss at or above entry."""
-    if not positions:
-        return True
-
-    for pos in positions:
-        if _get_position_side(pos) != "buy":
-            continue
-        entry = _safe_float(getattr(pos, "price_open", 0.0), 0.0)
-        sl = _safe_float(getattr(pos, "sl", 0.0), 0.0)
-        if sl <= 0:
-            return False
-        if sl < entry:
-            return False
-    return True
-
-
-def auto_calculate_volume(
-    account_balance: float,
-    risk_percent: float,
-    stop_distance: float,
-    pip_value: float = 10.0,
-    max_volume: float = 1.0,
+def compute_equilibrium_with_add(
+    positions: list[Any],
+    side: Literal["buy", "sell"],
+    add_volume: float,
+    add_price: float,
 ) -> float:
-    """Estimate lot volume from a risk percentage and price distance."""
-    risk_amount = account_balance * max(risk_percent, 0.0) / 100.0
-    if pip_value <= 0:
-        pip_value = 10.0
-    distance = max(abs(stop_distance), 0.0001)
-    volume = risk_amount / (distance * pip_value)
-    if volume <= 0:
-        return 0.01
-    return max(0.01, min(max_volume, round(volume, 2)))
+    """Port of EstimateEquilibriumWithAdd: breakeven of same-side group if the new lot were added."""
+    group = _filter_same_side(positions, side)
+    sum_vol_price = add_volume * add_price
+    sum_vol = add_volume
+    for pos in group:
+        volume = _safe_float(getattr(pos, "volume", 0.0), 0.0)
+        entry = _safe_float(getattr(pos, "price_open", add_price), add_price)
+        sum_vol_price += volume * entry
+        sum_vol += volume
+    if sum_vol <= 0:
+        return add_price
+    return sum_vol_price / sum_vol
+
+
+def calculate_lot_size(
+    entry: float,
+    sl: float,
+    risk_amount: float,
+    tick_value: float,
+    tick_size: float,
+    lot_step: float,
+    min_lot: float,
+    max_lot: float,
+) -> float:
+    """Port of CalculateLotSize (margin-cap step intentionally NOT ported here — needs live
+    MT5 order_calc_margin/free_margin, see note below)."""
+    sl_dist = abs(entry - sl)
+    if sl_dist <= 0 or tick_size <= 0 or lot_step <= 0:
+        return 0.0
+
+    lot_size = risk_amount / (sl_dist * (tick_value / tick_size))
+    lot_size = (lot_size // lot_step) * lot_step
+
+    if lot_size < min_lot:
+        return 0.0
+    return min(lot_size, max_lot)
+
+
+def calc_fibo_lot_size(
+    symbol_config: dict[str, Any],
+    positions: list[Any],
+    side: Literal["buy", "sell"],
+    entry: float,
+    risk_amount: float,
+    point: float,
+    tick_value: float,
+    tick_size: float,
+    lot_step: float,
+    min_lot: float,
+    max_lot: float,
+) -> float:
+    """Port of CalFiboLotSize. cnt<2: risk-based sizing off a fixed SL distance.
+    cnt>=2: martingale — sum of the two most recently opened same-side volumes, unclamped."""
+    group = _filter_same_side(positions, side)
+    if len(group) < 2:
+        sl_points = symbol_config["buy_sl_points"] if side == "buy" else symbol_config["sell_sl_points"]
+        sl_distance = sl_points * point
+        sl = entry - sl_distance if side == "buy" else entry + sl_distance
+        return calculate_lot_size(entry, sl, risk_amount, tick_value, tick_size, lot_step, min_lot, max_lot)
+
+    sorted_group = sorted(group, key=lambda p: getattr(p, "time", 0), reverse=True)
+    vol0 = _safe_float(getattr(sorted_group[0], "volume", 0.0), 0.0)
+    vol1 = _safe_float(getattr(sorted_group[1], "volume", 0.0), 0.0)
+    return vol0 + vol1
 
 
 def evaluate_open_signal(
@@ -80,76 +99,76 @@ def evaluate_open_signal(
     current_price: float,
     positions: list[Any],
     side: Literal["buy", "sell"],
+    point: float,
+    tick_value: float,
+    tick_size: float,
+    lot_step: float,
+    min_lot: float,
+    max_lot: float,
     threshold: float | None = None,
     account_balance: float = 1000.0,
     risk_percent: float | None = None,
-    max_volume: float | None = None,
 ) -> dict[str, Any]:
-    """Decision engine matching the MQL OpenOrder logic: same-side equilibrium and internal point-based threshold."""
-    config = get_trade_config()
+    """Port of OpenOrder. cnt==0: open directly, fixed-distance SL.
+    cnt>=1: martingale/risk sizing via CalFiboLotSize, then breakeven-with-add gate."""
+    config = get_trade_config(symbol) or DEFAULT_TRADE_CONFIG
     if threshold is None:
         threshold = config["buy_threshold_points"] if side == "buy" else config["sell_threshold_points"]
     if risk_percent is None:
         risk_percent = config["risk_percent"]
-    if max_volume is None:
-        max_volume = config["max_volume"]
 
-    equilibrium = compute_equilibrium_price(current_price, positions, side)
-    stop_loss_ok = check_buy_stoploss_moved(positions) if side == "buy" else True
+    risk_amount = account_balance * risk_percent / 100.0
+    group = _filter_same_side(positions, side)
+    cnt = len(group)
+
+    lot_size = calc_fibo_lot_size(
+        config, positions, side, current_price, risk_amount,
+        point, tick_value, tick_size, lot_step, min_lot, max_lot,
+    )
 
     result: dict[str, Any] = {
         "symbol": symbol,
         "side": side,
-        "equilibrium": equilibrium,
         "threshold": threshold,
         "allowed": False,
         "reason": "",
         "volume": 0.0,
         "entry_price": current_price,
         "stop_loss": current_price,
-        "take_profit": current_price,
     }
 
+    if lot_size <= 0:
+        result["reason"] = "Computed lot size is zero (below min lot or invalid SL distance)."
+        return result
+
+    if cnt == 0:
+        sl_points = config["buy_sl_points"] if side == "buy" else config["sell_sl_points"]
+        sl_distance = sl_points * point
+        sl = current_price - sl_distance if side == "buy" else current_price + sl_distance
+        result.update({
+            "allowed": True,
+            "reason": "No existing same-side position; opened directly.",
+            "volume": lot_size,
+            "stop_loss": sl,
+        })
+        return result
+
+    new_eq = compute_equilibrium_with_add(positions, side, lot_size, current_price)
     if side == "buy":
-        if not stop_loss_ok:
-            result["reason"] = "Existing buy positions still have stop loss below entry; wait for adjustment."
-            return result
-        if current_price <= equilibrium + threshold:
-            result["reason"] = f"Current price {current_price} is not above equilibrium {equilibrium} + threshold {threshold}."
-            return result
+        allowed = current_price > new_eq + threshold
+    else:
+        allowed = current_price < new_eq - threshold
 
-        stop_distance = max(current_price - equilibrium, 0.0001)
-        volume = auto_calculate_volume(account_balance, risk_percent, stop_distance, pip_value=10.0, max_volume=max_volume)
-        result.update(
-            {
-                "allowed": True,
-                "reason": "Buy condition satisfied.",
-                "volume": volume,
-                "stop_loss": equilibrium,
-                "take_profit": current_price + (current_price - equilibrium) * 2.0,
-            }
-        )
+    if not allowed:
+        result["reason"] = f"Price {current_price} not past breakeven-with-add {new_eq} by threshold {threshold}."
         return result
 
-    if side == "sell":
-        if current_price >= equilibrium - threshold:
-            result["reason"] = f"Current price {current_price} is not below equilibrium {equilibrium} - threshold {threshold}."
-            return result
-
-        stop_distance = max(equilibrium - current_price, 0.0001)
-        volume = auto_calculate_volume(account_balance, risk_percent, stop_distance, pip_value=10.0, max_volume=max_volume)
-        result.update(
-            {
-                "allowed": True,
-                "reason": "Sell condition satisfied.",
-                "volume": volume,
-                "stop_loss": equilibrium,
-                "take_profit": current_price - (equilibrium - current_price) * 2.0,
-            }
-        )
-        return result
-
-    result["reason"] = "Unsupported side. Use buy or sell."
+    result.update({
+        "allowed": True,
+        "reason": "Breakeven-with-add gate passed; SL moved to new equilibrium.",
+        "volume": lot_size,
+        "stop_loss": new_eq,
+    })
     return result
 
 
@@ -159,19 +178,13 @@ def evaluate_tp_signal(
     account_balance: float = 1000.0,
     threshold_rate: float | None = None,
 ) -> dict[str, Any]:
-    """Allow close only when the group profit exceeds the configured rate versus balance."""
-    config = get_trade_config()
+    config = get_trade_config(getattr(position, "symbol", "")) or DEFAULT_TRADE_CONFIG
     threshold_rate = config["tp_profit_rate_percent"] if threshold_rate is None else threshold_rate
 
     position_type = _get_position_side(position)
     entry = _safe_float(getattr(position, "price_open", current_price), current_price)
     volume = _safe_float(getattr(position, "volume", 0.0), 0.0)
-    current_profit = 0.0
-
-    if position_type == "buy":
-        current_profit = (current_price - entry) * volume
-    else:
-        current_profit = (entry - current_price) * volume
+    current_profit = (current_price - entry) * volume if position_type == "buy" else (entry - current_price) * volume
 
     balance = max(account_balance, 1.0)
     profit_rate = (current_profit / balance) * 100.0
@@ -191,11 +204,9 @@ def evaluate_tp_signal(
     if current_profit <= 0:
         result["reason"] = "Position has not profit yet."
         return result
-
     if profit_rate >= threshold_rate:
         result["allowed"] = True
         result["reason"] = f"Profit rate {profit_rate:.2f}% is above threshold {threshold_rate:.2f}%."
         return result
-
     result["reason"] = f"Profit rate {profit_rate:.2f}% is below threshold {threshold_rate:.2f}%."
     return result
