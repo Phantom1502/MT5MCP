@@ -351,20 +351,34 @@ const handleSessionAnalyze = (sseHub, completedMorning) => async ({ sessionContr
   const body = await readJsonBody(req);
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
   const jobType = typeof body.jobType === 'string' ? body.jobType : '';
-  const intent = typeof body.intent === 'string' ? body.intent : '';
   const symbol = typeof body.symbol === 'string' ? body.symbol.trim() : '';
   const requestId = typeof body.requestId === 'string' && body.requestId.trim()
     ? body.requestId.trim()
     : randomUUID();
 
   if (!sessionId) return sendError(res, 400, 'sessionId (string) is required');
-  if (!['morning_context', 'ltf_trigger'].includes(jobType)) {
-    return sendError(res, 400, 'jobType must be morning_context or ltf_trigger');
-  }
-  if (jobType === 'ltf_trigger' && !['open', 'tp'].includes(intent)) {
-    return sendError(res, 400, 'intent must be open or tp for ltf_trigger');
+  if (!['morning_context', 'htf_context', 'ltf_trigger'].includes(jobType)) {
+    return sendError(res, 400, 'jobType must be morning_context, htf_context, or ltf_trigger');
   }
   if (!symbol) return sendError(res, 400, 'symbol (string) is required');
+
+  let signals = null;
+  if (jobType === 'ltf_trigger') {
+    const rawSignals = body.signals;
+    if (!rawSignals || typeof rawSignals !== 'object') {
+      return sendError(res, 400, 'signals (object) is required for ltf_trigger');
+    }
+    signals = {
+      can_open_buy: !!rawSignals.can_open_buy,
+      can_open_sell: !!rawSignals.can_open_sell,
+      can_tp_buy: !!rawSignals.can_tp_buy,
+      can_tp_sell: !!rawSignals.can_tp_sell,
+    };
+    if (!Object.values(signals).some(Boolean)) {
+      return sendError(res, 400, 'at least one signal must be true for ltf_trigger');
+    }
+  }
+
   const morningKey = jobType === 'morning_context' ? morningJobKey(sessionId, symbol) : null;
   if (morningKey && completedMorning.has(morningKey)) {
     return sendJson(res, 200, {
@@ -383,25 +397,43 @@ const handleSessionAnalyze = (sseHub, completedMorning) => async ({ sessionContr
     return sendError(res, 409, `session ${sessionId} already has an analysis job`);
   }
 
-  const side = typeof body.side === 'string' ? body.side.toLowerCase() : null;
   const timeframes = Array.isArray(body.timeframes)
     ? body.timeframes.filter(value => typeof value === 'string').slice(0, 8)
     : [];
   const contextRef = typeof body.contextRef === 'string' ? body.contextRef : null;
+
+  const availableActions = signals
+    ? Object.entries(signals).filter(([, v]) => v).map(([k]) => k).join(', ')
+    : null;
+
+  const jobInstructions = {
+    morning_context: 'Build and retain the morning market context. Do not open or close trades.',
+    htf_context: [
+      'Review the higher-timeframe structure (trend direction, key support/resistance, recent range) and update your',
+      'working context accordingly. This is a periodic context refresh only — do not open or close any trades here,',
+      'even if you notice an opportunity; act on it only when a subsequent ltf_trigger request offers that action.',
+    ].join('\n'),
+    ltf_trigger: [
+      `Available actions right now: ${availableActions}.`,
+      'Use the MT5 MCP tools (price, candles, symbol info, news) to judge the current context yourself.',
+      'For each available action, decide independently whether to act on it now or skip it.',
+      'can_open_buy/can_open_sell: only call ask_for_open for that side if you judge it a good entry; the tool itself enforces sizing and safety.',
+      'can_tp_buy/can_tp_sell: only call ask_for_tp for that side if you judge it a good time to close; the tool itself enforces the profit threshold.',
+      'Do not ask for confirmation.',
+    ].join('\n'),
+  };
+
   const prompt = [
     'MT5 scheduler trigger. Perform the requested analysis using the available MT5 MCP tools.',
     `Job type: ${jobType}`,
     `Symbol: ${symbol}`,
-    side ? `Side: ${side}` : null,
     timeframes.length > 0 ? `Timeframes: ${timeframes.join(', ')}` : null,
     contextRef ? `Morning context reference: ${contextRef}` : null,
     '',
-    jobType === 'morning_context'
-      ? 'Build and retain the morning market context. Do not open or close trades.'
-      : `Analyze the LTF trigger against the current context for intent "${intent}". ${intent === 'open' ? 'Only call ask_for_open if the server-side conditions are satisfied.' : 'Only call ask_for_tp if the server-side TP conditions are satisfied.'} Do not ask for confirmation.`,
+    jobInstructions[jobType],
   ].filter(Boolean).join('\n');
 
-  pendingAnalysis.set(requestId, { requestId, sessionId, jobType, intent: intent || null, symbol, createdAt: Date.now() });
+  pendingAnalysis.set(requestId, { requestId, sessionId, jobType, symbol, createdAt: Date.now() });
   pendingAnalysis.set(sessionId, requestId);
   try {
     const controller = new AbortController();
@@ -417,7 +449,7 @@ const handleSessionAnalyze = (sseHub, completedMorning) => async ({ sessionContr
     return sendError(res, 409, error instanceof Error ? error.message : String(error));
   }
 
-  sendJson(res, 202, { ok: true, requestId, sessionId, jobType, intent: intent || null, status: 'accepted' });
+  sendJson(res, 202, { ok: true, requestId, sessionId, jobType, signals, status: 'accepted' });
 };
 
 /**

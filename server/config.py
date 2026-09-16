@@ -17,11 +17,11 @@ DEFAULT_TRADE_CONFIG: dict[str, float] = {
 
 SYMBOL_TRADE_CONFIG: dict[str, dict[str, float]] = {
     "XAUUSDc": {
-        "buy_threshold_points": 500.0,
-        "sell_threshold_points": 500.0,
-        "buy_sl_points": 5000.0,
-        "sell_sl_points": 5000.0,
-        "risk_percent": 0.25,
+        "buy_threshold_points": 10000.0,
+        "sell_threshold_points": 10000.0,
+        "buy_sl_points": 10000.0,
+        "sell_sl_points": 10000.0,
+        "risk_percent": 0.5,
         "max_volume": 1.0,
         "tp_multiplier": 2.0,
         "buy_sl_required": 1.0,
