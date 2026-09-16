@@ -14,7 +14,8 @@ input int InpWebRequestTimeoutMs = 10000;
 input double InpTrailingThresholdPoints = 1000;
 input double InpBufferThresholdPoints = 500;
 
-input ENUM_TIMEFRAMES InpAnalysisTimeframe = PERIOD_CURRENT;
+input ENUM_TIMEFRAMES InpExecutionTimeframe = PERIOD_M5;
+input ENUM_TIMEFRAMES InpHtfTimeframe = PERIOD_H4;
 input ENUM_MA_METHOD InpMAMethod = MODE_EMA;
 input ENUM_APPLIED_PRICE InpMAApplied = PRICE_CLOSE;
 input int InpFastMAPeriod = 12;
@@ -24,13 +25,14 @@ input double InpFastMACloseWeight = 0.35;
 input double InpOpenThreshold = 6.1;
 input double InpCloseThreshold = 2.9;
 input bool InpRequestMorningContext = true;
+input bool InpRequestHtfContext = true;
 
 int g_fastHandle = INVALID_HANDLE;
 int g_slowHandle = INVALID_HANDLE;
-datetime g_lastBarTime = 0;
+datetime g_lastExecBarTime = 0;
+datetime g_lastHtfBarTime = 0;
 uint g_requestCounter = 0;
 string g_morningStateKey;
-string g_lastSignal = "NONE";
 
 string CurrentDateKey()
 {
@@ -55,7 +57,26 @@ string NewRequestId(const string kind)
    return StringFormat("%s-%s-%d-%u", kind, _Symbol, (int)TimeLocal(), g_requestCounter);
 }
 
-bool PostAnalysis(const string jobType, const string intent, const string side, const string trigger)
+string TimeframeToString(const ENUM_TIMEFRAMES tf)
+{
+   switch(tf)
+   {
+      case PERIOD_M1:  return "M1";
+      case PERIOD_M5:  return "M5";
+      case PERIOD_M15: return "M15";
+      case PERIOD_M30: return "M30";
+      case PERIOD_H1:  return "H1";
+      case PERIOD_H4:  return "H4";
+      case PERIOD_D1:  return "D1";
+      case PERIOD_W1:  return "W1";
+      case PERIOD_MN1: return "MN1";
+      default:         return "M5";
+   }
+}
+
+// jobType decides which timeframe input is reported; signalsJson is a pre-built
+// JSON object string (or "" when the job carries no signals, e.g. morning/htf).
+bool PostAnalysis(const string jobType, const string signalsJson, const string trigger)
 {
    if(StringLen(InpDshSessionId) == 0)
    {
@@ -63,11 +84,13 @@ bool PostAnalysis(const string jobType, const string intent, const string side, 
       return false;
    }
 
+   ENUM_TIMEFRAMES tf = (jobType == "htf_context") ? InpHtfTimeframe : InpExecutionTimeframe;
    string requestId = NewRequestId(jobType);
+   string signalsField = StringLen(signalsJson) > 0 ? StringFormat(",\"signals\":%s", signalsJson) : "";
    string body = StringFormat(
-      "{\"sessionId\":\"%s\",\"requestId\":\"%s\",\"jobType\":\"%s\",\"intent\":\"%s\",\"symbol\":\"%s\",\"side\":\"%s\",\"timeframes\":[\"M15\",\"M5\"],\"trigger\":\"%s\"}",
+      "{\"sessionId\":\"%s\",\"requestId\":\"%s\",\"jobType\":\"%s\",\"symbol\":\"%s\",\"timeframes\":[\"%s\"]%s,\"trigger\":\"%s\"}",
       JsonEscape(InpDshSessionId), JsonEscape(requestId), JsonEscape(jobType),
-      JsonEscape(intent), JsonEscape(_Symbol), JsonEscape(side), JsonEscape(trigger));
+      JsonEscape(_Symbol), TimeframeToString(tf), signalsField, JsonEscape(trigger));
 
    char payload[];
    char response[];
@@ -94,25 +117,35 @@ bool MorningAlreadyRequested()
    return GlobalVariableCheck(g_morningStateKey) && GlobalVariableGet(g_morningStateKey) > 0;
 }
 
+// ── Tầng 1: đầu ngày, tổng quan ─────────────────────────────────────
 void RequestMorningContext()
 {
    if(!InpRequestMorningContext || MorningAlreadyRequested())
       return;
 
-   if(PostAnalysis("morning_context", "", "", "daily_schedule"))
+   if(PostAnalysis("morning_context", "", "daily_schedule"))
    {
       GlobalVariableSet(g_morningStateKey, (double)TimeCurrent());
       PrintFormat("Morning analysis accepted for %s.", _Symbol);
    }
 }
 
-bool IsNewBar()
+// ── Tầng 2: định kỳ theo HTF, cập nhật bối cảnh trung hạn ───────────
+bool IsNewHtfBar()
 {
-   datetime currentBar = iTime(_Symbol, InpAnalysisTimeframe, 0);
-   if(currentBar <= 0 || currentBar == g_lastBarTime)
+   datetime currentBar = iTime(_Symbol, InpHtfTimeframe, 0);
+   if(currentBar <= 0 || currentBar == g_lastHtfBarTime)
       return false;
-   g_lastBarTime = currentBar;
+   g_lastHtfBarTime = currentBar;
    return true;
+}
+
+void RequestHtfContext()
+{
+   if(!InpRequestHtfContext || !IsNewHtfBar())
+      return;
+
+   PostAnalysis("htf_context", "", "new_htf_bar");
 }
 
 bool ReadMAValues(const int handle, double &currentValue, double &previousValue)
@@ -137,14 +170,19 @@ double CalculateAngle(const int handle)
    return MathArctan(slope) * 180.0 / M_PI;
 }
 
-void RequestLtfAnalysis(const string intent, const string side, const string trigger)
+// ── Tầng 3: mỗi nến execution, lọc sơ bộ rồi để model quyết định ────
+bool IsNewExecBar()
 {
-   PostAnalysis("ltf_trigger", intent, side, trigger);
+   datetime currentBar = iTime(_Symbol, InpExecutionTimeframe, 0);
+   if(currentBar <= 0 || currentBar == g_lastExecBarTime)
+      return false;
+   g_lastExecBarTime = currentBar;
+   return true;
 }
 
-void CheckMATriggers()
+void CheckLtfTriggers()
 {
-   if(!IsNewBar())
+   if(!IsNewExecBar())
       return;
 
    double fastAngle = CalculateAngle(g_fastHandle);
@@ -152,31 +190,27 @@ void CheckMATriggers()
    double openWeight = fastAngle * InpFastMAOpenWeight + slowAngle * (1.0 - InpFastMAOpenWeight);
    double closeWeight = fastAngle * InpFastMACloseWeight + slowAngle * (1.0 - InpFastMACloseWeight);
 
-   PrintFormat("Fast Angle: %.1f, Slow Angle: %.1f, Open Weight: %.1f, Close Weight: %.1f",
-               fastAngle, slowAngle, openWeight, closeWeight);
-   g_lastSignal = "NONE";
+   bool canOpenBuy  = openWeight  >= InpOpenThreshold;
+   bool canOpenSell = openWeight  <= -InpOpenThreshold;
+   // TODO: hiện đang tạm dùng thuần MA-angle cho TP; sẽ thay bằng pos-manager
+   // check lời/lỗ thật khi class đó sẵn sàng.
+   bool canTpBuy    = closeWeight <= -InpCloseThreshold;
+   bool canTpSell   = closeWeight >= InpCloseThreshold;
 
-   if(closeWeight <= -InpCloseThreshold)
-   {
-      g_lastSignal = "REQUEST TP BUY";
-      RequestLtfAnalysis("tp", "buy", "ma_close_threshold");
-   }
-   else if(closeWeight >= InpCloseThreshold)
-   {
-      g_lastSignal = "REQUEST TP SELL";
-      RequestLtfAnalysis("tp", "sell", "ma_close_threshold");
-   }
+   PrintFormat("LTF filter: open=%.1f close=%.1f buy=%s sell=%s tpBuy=%s tpSell=%s",
+               openWeight, closeWeight,
+               canOpenBuy ? "T" : "F", canOpenSell ? "T" : "F",
+               canTpBuy ? "T" : "F", canTpSell ? "T" : "F");
 
-   if(openWeight >= InpOpenThreshold)
-   {
-      g_lastSignal = "REQUEST BUY ANALYSIS";
-      RequestLtfAnalysis("open", "buy", "ma_open_threshold");
-   }
-   else if(openWeight <= -InpOpenThreshold)
-   {
-      g_lastSignal = "REQUEST SELL ANALYSIS";
-      RequestLtfAnalysis("open", "sell", "ma_open_threshold");
-   }
+   if(!canOpenBuy && !canOpenSell && !canTpBuy && !canTpSell)
+      return; // Không có gì đáng báo — khỏi làm phiền model.
+
+   string signalsJson = StringFormat(
+      "{\"can_open_buy\":%s,\"can_open_sell\":%s,\"can_tp_buy\":%s,\"can_tp_sell\":%s}",
+      canOpenBuy ? "true" : "false", canOpenSell ? "true" : "false",
+      canTpBuy ? "true" : "false", canTpSell ? "true" : "false");
+
+   PostAnalysis("ltf_trigger", signalsJson, "ma_threshold");
 }
 
 void TrailPositions()
@@ -245,9 +279,8 @@ int OnInit()
    if(InpCloseThreshold <= 0.0 || InpOpenThreshold <= 0.0)
       return INIT_PARAMETERS_INCORRECT;
 
-   ENUM_TIMEFRAMES timeframe = InpAnalysisTimeframe == PERIOD_CURRENT ? (ENUM_TIMEFRAMES)_Period : InpAnalysisTimeframe;
-   g_fastHandle = iMA(_Symbol, timeframe, InpFastMAPeriod, 0, InpMAMethod, InpMAApplied);
-   g_slowHandle = iMA(_Symbol, timeframe, InpSlowMAPeriod, 0, InpMAMethod, InpMAApplied);
+   g_fastHandle = iMA(_Symbol, InpExecutionTimeframe, InpFastMAPeriod, 0, InpMAMethod, InpMAApplied);
+   g_slowHandle = iMA(_Symbol, InpExecutionTimeframe, InpSlowMAPeriod, 0, InpMAMethod, InpMAApplied);
    if(g_fastHandle == INVALID_HANDLE || g_slowHandle == INVALID_HANDLE)
       return INIT_FAILED;
 
@@ -272,6 +305,7 @@ void OnTimer()
 void OnTick()
 {
    TrailPositions();
-   CheckMATriggers();
+   RequestHtfContext();
+   CheckLtfTriggers();
 }
 //+------------------------------------------------------------------+
